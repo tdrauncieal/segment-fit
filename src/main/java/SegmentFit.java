@@ -3,7 +3,9 @@
  *
  * Herramienta para:
  *  - Leer un archivo .FIT de Garmin
- *  - Detectar un segmento definido por GPS (punto inicio / punto fin)
+ *  - Detectar un segmento definido por GPS
+ *      * start -> end
+ *      * loop (detección de circuito y vueltas completas)
  *  - Extraer solo ese tramo
  *  - Generar un nuevo archivo .FIT válido con los records del segmento
  *
@@ -12,7 +14,8 @@
  *  - fit-java-sdk (probado con 21.188.0)
  *
  * Uso típico:
- *   java -cp .:fit-21.188.0.jar SegmentFit actividad.fit --start=lat,lon --end=lat,lon
+ *   java SegmentFit actividad.fit --start=lat,lon --end=lat,lon
+ *   java SegmentFit actividad.fit --start=lat,lon --loop [--radius=10]
  *
  * Autor: Daniel Sappa
  * Copyright (c) 2026 Daniel Sappa
@@ -21,17 +24,27 @@
  * Ver el archivo LICENSE para más detalles.
  */
 
-import com.garmin.fit.*;
-
-import java.io.FileInputStream;
 import java.io.File;
-import java.util.*;
+import java.io.FileInputStream;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+
+import com.garmin.fit.DateTime;
+import com.garmin.fit.Decode;
+import com.garmin.fit.FileEncoder;
+import com.garmin.fit.FileIdMesg;
+import com.garmin.fit.Manufacturer;
+import com.garmin.fit.MesgBroadcaster;
+import com.garmin.fit.RecordMesg;
+import com.garmin.fit.SessionMesg;
+import com.garmin.fit.Sport;
+import com.garmin.fit.SportMesg;
 
 public class SegmentFit {
 
-    /**
-     * Conversión de semicircles FIT a grados.
+    /** Conversión FIT semicircles → grados
      *
      * En FIT, lat/lon se almacenan como enteros en "semicircles".
      * Fórmula oficial:
@@ -90,6 +103,40 @@ public class SegmentFit {
         return idx;
     }
 
+    /**
+     * Devuelve todos los índices donde el track pasa
+     * a menos de radiusMeters del punto dado.
+     */
+    static List<Integer> allPasses(
+            List<Point> pts,
+            double lat,
+            double lon,
+            double radiusMeters) {
+
+        List<Integer> idxs = new ArrayList<>();
+        for (int i = 0; i < pts.size(); i++) {
+            Point p = pts.get(i);
+            double d = haversine(p.lat, p.lon, lat, lon);
+            if (d <= radiusMeters) {
+                idxs.add(i);
+            }
+        }
+        return idxs;
+    }
+
+    /**
+     * Distancia mínima de un punto al circuito (plantilla).
+     * Aproximación suficiente para GPS.
+     */
+    static double minDistToCircuit(Point p, List<Point> circuit) {
+        double min = Double.MAX_VALUE;
+        for (Point c : circuit) {
+            double d = haversine(p.lat, p.lon, c.lat, c.lon);
+            if (d < min) min = d;
+        }
+        return min;
+    }
+
     public static void main(String[] args) throws Exception {
 
         /**
@@ -98,11 +145,15 @@ public class SegmentFit {
         if (args.length < 3) {
             System.err.println("Uso:");
             System.err.println("java SegmentFit archivo.fit --start=lat,lon --end=lat,lon");
+            System.err.println("java SegmentFit archivo.fit --start=lat,lon --loop [--radius=10]");
             System.exit(1);
         }
 
         String fitFile = args[0];
-        double startLat = 0, startLon = 0, endLat = 0, endLon = 0;
+        double startLat = 0, startLon = 0;
+        double endLat = 0, endLon = 0;
+        boolean loop = false;
+        double radius = 10.0;
 
         /**
          * Parseo de argumentos --start y --end
@@ -117,6 +168,12 @@ public class SegmentFit {
                 String[] p = a.substring(6).split(",");
                 endLat = Double.parseDouble(p[0]);
                 endLon = Double.parseDouble(p[1]);
+            }
+            if (a.equals("--loop")) {
+                loop = true;
+            }
+            if (a.startsWith("--radius=")) {
+                radius = Double.parseDouble(a.substring(9));
             }
         }
 
@@ -163,12 +220,73 @@ public class SegmentFit {
             throw new RuntimeException("No hay puntos suficientes");
         }
 
-        /**
-         * Encontrar índices de inicio y fin más cercanos
-         * a las coordenadas indicadas.
-         */
-        int i0 = nearestIndex(points, startLat, startLon);
-        int i1 = nearestIndex(points, endLat, endLon);
+        /** Determinar segmento */
+        int i0, i1;
+
+        if (loop) {
+
+            // ========= PASO 1: detectar UNA vuelta (plantilla) =========
+            List<Integer> passes = allPasses(points, startLat, startLon, radius);
+            if (passes.size() < 2) {
+                throw new RuntimeException(
+                        "No se detectaron dos pasos por el punto inicial");
+            }
+            i0 = passes.get(0);
+            i1 = -1;
+
+            boolean leftRadius = false;
+            for (int idx = i0 + 1; idx < points.size(); idx++) {
+                double d = haversine(points.get(idx).lat, points.get(idx).lon, startLat, startLon);
+                if (d > radius) leftRadius = true;
+                if (leftRadius && d <= radius) {
+                    i1 = idx;
+                    break;
+                }
+            }
+
+            if (i1 == -1)
+                throw new RuntimeException("No se detectó el cierre del bucle");
+
+            // Plantilla del circuito (una vuelta completa)
+            List<Point> circuit = points.subList(i0, i1 + 1);
+
+            // ========= PASO 2: detectar todas las vueltas completas =========
+            int segStart = -1;
+            int segEnd = -1;
+            boolean onCircuit = false;
+            boolean completedLap = false;
+
+            for (int idx = 0; idx < points.size(); idx++) {
+                double d = minDistToCircuit(points.get(idx), circuit);
+
+                if (!onCircuit && d <= radius) {
+                    onCircuit = true;
+                    if (completedLap) {
+                        if (segStart == -1) segStart = idx;
+                        segEnd = idx;
+                    }
+                }
+
+                if (onCircuit && d > radius) {
+                    onCircuit = false;
+                    completedLap = true;
+                }
+            }
+
+            if (segStart == -1 || segEnd == -1 || segEnd <= segStart)
+                throw new RuntimeException("No se detectaron vueltas completas");
+
+            i0 = segStart;
+            i1 = segEnd;
+
+        } else {
+            /**
+             * Encontrar índices de inicio y fin más cercanos
+             * a las coordenadas indicadas.
+             */
+            i0 = nearestIndex(points, startLat, startLon);
+            i1 = nearestIndex(points, endLat, endLon);
+        }
 
         // Asegurar orden correcto
         if (i0 > i1) {
@@ -205,16 +323,27 @@ public class SegmentFit {
         /**
          * Escritura de cada punto del segmento como RecordMesg.
          */
+        double totalDistance = 0.0;
+        Point prev = null;
         for (Point p : seg) {
+            if (prev != null) {
+                totalDistance += haversine(
+                        prev.lat, prev.lon,
+                        p.lat, p.lon
+                );
+            }
+
             RecordMesg r = new RecordMesg();
             r.setTimestamp(p.ts);
             r.setPositionLat((int)(p.lat / DEG));
             r.setPositionLong((int)(p.lon / DEG));
+            r.setDistance((float) totalDistance);
             if (p.hr != null) r.setHeartRate(p.hr);
             if (p.speed != null) r.setSpeed(p.speed);
             if (p.cadence != null) r.setCadence(p.cadence);
             if (p.altitude != null) r.setAltitude(p.altitude);
             encoder.write(r);
+            prev = p;
         }
 
         /**
@@ -224,6 +353,15 @@ public class SegmentFit {
         SessionMesg session = new SessionMesg();
         session.setSport(Sport.CYCLING);
         session.setStartTime(seg.get(0).ts);
+        session.setTotalDistance((float) totalDistance);
+
+        long startTs = seg.get(0).ts.getTimestamp();
+        long endTs   = seg.get(seg.size() - 1).ts.getTimestamp();
+        float elapsed = endTs - startTs;
+
+        session.setTotalElapsedTime(elapsed);
+        session.setTotalTimerTime(elapsed);
+
         encoder.write(session);
 
         /**

@@ -1,12 +1,17 @@
 # SegmentFit
 
-Herramienta en Java para procesar archivos **Garmin .FIT** y extraer un segmento específico definido por coordenadas GPS (punto de inicio y punto de fin), generando un nuevo archivo `.FIT` válido con los records correspondientes a ese tramo.
+Herramienta en Java para procesar archivos **Garmin .FIT** y extraer un segmento específico definido por coordenadas GPS, generando un nuevo archivo `.FIT` válido con los records correspondientes a ese tramo.
+
+Soporta dos modos de segmentación:
+- **Inicio → fin**
+- **Loop** (desde el primer cruce por el punto de inicio hasta el segundo cruce)
 
 ## 🚴 Características
 
 - Lee archivos `.FIT` generados por dispositivos Garmin
 - Detecta un segmento por:
   - Punto inicio → punto fin (coordenadas GPS)
+  - **Loop**: desde el punto de inicio hasta volver a cruzarlo nuevamente
 - Extrae únicamente los records del segmento
 - Genera un nuevo archivo `.FIT` válido
 
